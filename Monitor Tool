@@ -1,0 +1,1283 @@
+#!/bin/bash
+
+# Server Diagnostics Tool
+# Version: 1.2.0
+
+# Global variables
+LOG_DIR="/var/log"
+APACHE_LOG="/usr/local/apache/logs/access_log"
+APACHE_ERROR_LOG="/usr/local/apache/logs/error_log"
+MYSQL_SLOW_LOG=""
+MYSQL_ERROR_LOG=""
+SYSTEM_LOG="/var/log/messages"
+ACCESS_LOGS="/home/*/access-logs/*"
+TEMP_DIR=$(mktemp -d)
+API_KEY="1945b35d5822163a8b3516d9c5a16717b7802b950e7b606a589483d9cab26c7778e538ddf33a06f4"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Cloudflare configuration
+CF_EMAIL=""
+CF_APIKEY=""
+CF_ZONEID=""
+UPPER_CPU_LIMIT=35
+LOWER_CPU_LIMIT=5
+REGULAR_STATUS="high"
+TIME_LIMIT_BEFORE_REVERT=$((60 * 5)) # 5 minutes
+
+# Function to check if a command exists
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Function to display menu and get user choice
+display_menu() {
+    clear
+    echo -e "${BLUE}=== Server Diagnostics Tool ===${NC}"
+    echo "1) Check System Resources"
+    echo "2) Analyze Network Traffic"
+    echo "3) Perform Security Checks"
+    echo "4) Monitor Processes"
+    echo "5) Check Database Performance"
+    echo "6) Check Disk I/O Performance"
+    echo "7) Analyze Log Files"
+    echo "8) Compare with Historical Data"
+    echo "9) Check System Health"
+    echo "10) Detect IPs with Many Connections"
+    echo "11) Detect Quick Connections/Disconnections"
+    echo "12) Analyze Access Logs for Bot Traffic"
+    echo "13) Cloudflare Under Attack Mode"
+    echo "14) Detect Content Management Systems"
+    echo "15) Imunify Antivirus Scan"
+    echo "0) Exit"
+    echo
+    read -p "Enter your choice: " choice
+}
+
+# Function to check system resources
+check_system_resources() {
+    echo -e "${BLUE}=== System Resource Analysis ===${NC}"
+    
+    cpu_usage=$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1}')
+    memory_usage=$(free -m | awk 'NR==2{printf "%.2f", $3*100/$2}')
+    load_average=$(uptime | awk '{print $(NF-2)" "$(NF-1)" "$NF}' | tr -d ',')
+    
+    top_cpu_processes=$(ps axo pid,etime,%cpu,%mem,cmd --sort=-%cpu | grep -v grep | head -n 15)
+    top_memory_processes=$(ps axo pid,etime,%cpu,%mem,cmd --sort=-%mem | grep -v grep | head -n 15)
+
+    echo -e "${YELLOW}CPU Usage:${NC} $cpu_usage%"
+    echo -e "${YELLOW}Memory Usage:${NC} $memory_usage%"
+    echo -e "${YELLOW}Load Average:${NC} $load_average"
+    echo -e "${YELLOW}Top 15 CPU-consuming processes:${NC}"
+    echo "$top_cpu_processes"
+    echo -e "${YELLOW}Top 15 Memory-consuming processes:${NC}"
+    echo "$top_memory_processes"
+}
+
+# Function to analyze network traffic
+# Function to analyze network traffic
+analyze_network_traffic() {
+    echo -e "${BLUE}=== Network Traffic Analysis ===${NC}"
+
+    if ! command -v tcpdump >/dev/null 2>&1; then
+        echo "Installing tcpdump..."
+        yum install tcpdump -y
+    fi
+
+    echo -e "${YELLOW}Top 10 IP connections:${NC}"
+    netstat -ntu | awk '{print $5}' | cut -d: -f1 | sort | uniq -c | sort -nr | head -n 10
+    
+    echo -e "\n${YELLOW}Networks with most connections:${NC}"
+    netstat -ntu | awk '{print $5}' | cut -d: -f1 -s | cut -f1,2 -d'.' | sed 's/$/.0.0/' | sort | uniq -c | sort -nk1 -r | head -n 10
+    
+    echo -e "\n${YELLOW}Analyzing potential SYN flood attacks:${NC}"
+    syn_flood=$(netstat -n | grep SYN_RECV | wc -l)
+    echo "Current half-open connections: $syn_flood"
+    if [ $syn_flood -gt 1000 ]; then
+        echo -e "${RED}WARNING: High number of half-open connections detected. Possible SYN flood attack.${NC}"
+        echo -e "\n${YELLOW}Top 50 IPs with half-open connections:${NC}"
+        netstat -n | grep SYN_RECV | awk '{print $5}' | cut -d: -f1 | sort | uniq -c | sort -nr | head -n 15
+    fi
+    
+    echo -e "\n${YELLOW}Performing brief packet capture for analysis:${NC}"
+    echo "Capturing packets for 10 seconds..."
+    timeout 10 tcpdump -nn -i any -w /tmp/capture.pcap >/dev/null 2>&1
+
+    echo "Analyzing captured packets:"
+
+    SERVER_IP=$(ip addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -n1)
+
+    echo -e "\n${YELLOW}Top IPs and AbuseIPDB check:${NC}"
+    tcpdump -nn -r /tmp/capture.pcap 2>/dev/null | 
+    awk '{ip1=$3; ip2=$5; sub(/\.[^.]+$/, "", ip1); sub(/\.[^.]+$/, "", ip2); 
+         if (ip1 != "") print ip1; if (ip2 != "") print ip2}' | 
+    sort | uniq -c | sort -nr | head -n 10 |
+    while read count ip; do
+        if [ "$ip" != "$SERVER_IP" ]; then
+            if command_exists jq; then
+                check_result=$(check_ip_blacklist "$ip")
+                if [ -n "$check_result" ]; then
+                    confidence=$(echo "$check_result" | awk -F'[()]' '{print $2}' | cut -d'%' -f1)
+                    if [ "$confidence" -gt 25 ]; then
+                        echo -e "${RED}$ip - $count packets - AbuseIPDB confidence: $confidence%${NC}"
+                        read -p "Do you want to block this IP using CSF? (y/n) " block
+                        if [ "$block" = "y" ]; then
+                            if ! systemctl is-active --quiet csf; then
+                                echo "CSF is not running. Enabling CSF..."
+                                csf -e
+                            fi
+                            csf -d "$ip"
+                            echo "$ip has been blocked using CSF"
+                        fi
+                    else
+                        echo "$ip - $count packets - AbuseIPDB confidence: $confidence%"
+                    fi
+                else
+                    echo "$ip - $count packets - Not found in AbuseIPDB"
+                fi
+            else
+                echo -e "${YELLOW}jq is not installed. Unable to check IP against AbuseIPDB.${NC}"
+            fi
+        else
+            echo "$ip - $count packets (Server IP)"
+        fi
+    done
+
+    rm /tmp/capture.pcap
+}
+
+# Function to analyze log files
+analyze_logs() {
+    echo -e "${BLUE}=== Log File Analysis ===${NC}"
+    echo -e "${YELLOW}RECENT APACHE ERRORS:${NC}"
+    if [ -f "$APACHE_ERROR_LOG" ]; then
+        tail -n 50 "$APACHE_ERROR_LOG" | grep -i error
+    else
+        echo -e "${RED}Apache error log not found at $APACHE_ERROR_LOG${NC}"
+    fi
+    
+    echo -e "${YELLOW}RECENT MYSQL SLOW QUERIES:${NC}"
+    if [ -f "$MYSQL_SLOW_LOG" ]; then
+        tail -n 10 "$MYSQL_SLOW_LOG" | grep -i "query time"
+    else
+        echo -e "${RED}MySQL slow query log not found at $MYSQL_SLOW_LOG${NC}"
+    fi
+    
+    echo -e "${YELLOW}RECENT MYSQL ERRORS:${NC}"
+    if [ -f "$MYSQL_ERROR_LOG" ]; then
+        tail -n 50 "$MYSQL_ERROR_LOG" | grep -i error
+    else
+        echo -e "${RED}MySQL error log not found at $MYSQL_ERROR_LOG${NC}"
+    fi
+    
+    echo -e "${YELLOW}RECENT SYSTEM ERRORS, OOM, AND KERNEL MESSAGES:${NC}"
+    if [ -f "$SYSTEM_LOG" ]; then
+        grep -i 'error\|out of memory\|panic\|kernel' "$SYSTEM_LOG" | tail -n 50
+    else
+        echo -e "${RED}System log not found at $SYSTEM_LOG${NC}"
+    fi
+    
+    echo -e "${YELLOW}OUT OF MEMORY ERRORS:${NC}"
+    if [ -f "$SYSTEM_LOG" ]; then
+        grep -i 'Out of memory' "$SYSTEM_LOG" | tail -n 10
+    else
+        echo -e "${RED}System log not found at $SYSTEM_LOG${NC}"
+    fi
+}
+
+# Function to monitor processes
+monitor_processes() {
+    echo -e "${BLUE}=== Process Monitoring ===${NC}"
+    echo -e "${YELLOW}Top 10 CPU-consuming processes:${NC}"
+    ps aux --sort=-%cpu | head -n 11
+    echo -e "${YELLOW}Top 10 memory-consuming processes:${NC}"
+    ps aux --sort=-%mem | head -n 11
+}
+
+# Function to check database performance
+check_database_performance() {
+    echo -e "${BLUE}=== Database Performance ===${NC}"
+    
+    if command_exists mysql; then
+        mysql_version=$(mysql --version)
+        if [[ $mysql_version == *"MariaDB"* ]]; then
+            MYSQL_SLOW_LOG=$(find /var/lib/mysql -name "*-slow.log" 2>/dev/null | head -n 1)
+            MYSQL_ERROR_LOG=$(grep "log_error" /etc/my.cnf.d/* 2>/dev/null | awk -F "=" '{print $2}' | tr -d ' ')
+        else
+            MYSQL_SLOW_LOG=$(grep "slow_query_log_file" /etc/my.cnf 2>/dev/null | awk -F "=" '{print $2}' | tr -d ' ')
+            MYSQL_ERROR_LOG=$(grep "log_error" /etc/my.cnf 2>/dev/null | awk -F "=" '{print $2}' | tr -d ' ')
+        fi
+    else
+        echo -e "${RED}MySQL/MariaDB is not installed or not in PATH${NC}"
+        return
+    fi
+    
+    echo -e "${YELLOW}MySQL version:${NC} $mysql_version"
+    echo -e "${YELLOW}MySQL status:${NC}"
+    mysql_status=$(mysqladmin status 2>/dev/null)
+    if [ $? -eq 0 ]; then
+        echo "$mysql_status"
+        
+        echo -e "${YELLOW}InnoDB status:${NC}"
+        innodb_status=$(mysql -e "SHOW ENGINE INNODB STATUS\G" 2>/dev/null | grep -E "Log sequence number|Log flushed up to|Last checkpoint at")
+        echo "$innodb_status"
+        
+        slow_queries=$(echo "$mysql_status" | awk '{print $11}')
+        if [ "$slow_queries" -gt 0 ]; then
+            echo -e "${RED}WARNING: $slow_queries slow queries detected${NC}"
+            if [ -f "$MYSQL_SLOW_LOG" ]; then
+                echo -e "${YELLOW}Recent slow queries:${NC}"
+                tail -n 10 "$MYSQL_SLOW_LOG"
+                analyze_slow_queries
+            else
+                echo -e "${RED}No slow query log file found at $MYSQL_SLOW_LOG${NC}"
+            fi
+        else
+            echo -e "${GREEN}No slow queries detected${NC}"
+        fi
+        
+        log_seq=$(echo "$innodb_status" | grep "Log sequence number" | awk '{print $4}')
+        log_flushed=$(echo "$innodb_status" | grep "Log flushed up to" | awk '{print $5}')
+        last_checkpoint=$(echo "$innodb_status" | grep "Last checkpoint at" | awk '{print $4}')
+        
+        if [ "$log_seq" = "$log_flushed" ] && [ "$log_seq" = "$last_checkpoint" ]; then
+            echo -e "${GREEN}InnoDB status: OK${NC}"
+        else
+            echo -e "${RED}WARNING: InnoDB logs are not in sync${NC}"
+            echo -e "${YELLOW}Recommendations to fix:${NC}"
+            echo "1. Check available disk space"
+            echo "2. Increase innodb_log_file_size if necessary"
+            echo "3. Restart MySQL/MariaDB service"
+            echo -e "${YELLOW}Commands to fix:${NC}"
+            echo "df -h"
+            echo "mysql -e 'SHOW VARIABLES LIKE \"innodb_log_file_size\"'"
+            echo "sudo systemctl restart mysql"
+        fi
+    else
+        echo -e "${RED}Unable to get MySQL status. Check if MySQL is running and you have proper permissions.${NC}"
+    fi
+
+    echo -e "\n${YELLOW}Performing detailed MySQL/MariaDB checks...${NC}"
+    
+    echo -e "\n${YELLOW}Checking table fragmentation:${NC}"
+    fragmentation_result=$(mysql -e "SELECT TABLE_SCHEMA, TABLE_NAME, DATA_FREE, DATA_LENGTH, INDEX_LENGTH FROM information_schema.TABLES WHERE TABLE_SCHEMA NOT IN ('information_schema', 'performance_schema', 'mysql') AND DATA_FREE > 0 ORDER BY DATA_FREE DESC LIMIT 10;" | column -t)
+    echo "$fragmentation_result"
+    
+    if [ -n "$fragmentation_result" ]; then
+        echo -e "\n${YELLOW}Explanation:${NC}"
+        echo "Table Fragmentation: The output shows tables with high DATA_FREE values, which indicates fragmentation."
+        echo "Fragmentation occurs when data is not stored contiguously, leading to slower queries and inefficient storage use."
+        echo -e "\n${YELLOW}Recommendations:${NC}"
+        echo "1. You can optimize tables using: mysqlcheck -o --all-databases"
+        echo "2. For a more thorough approach, consider dumping and re-importing the database."
+        echo -e "\n${YELLOW}Note on innodb_file_per_table:${NC}"
+        echo "Setting innodb_file_per_table = 1 allows each InnoDB table to have its own tablespace file."
+        echo "This can improve performance and make table-level operations (like OPTIMIZE TABLE) more efficient."
+        echo "Dumping and re-importing with this setting enabled can lead to better initial table organization."
+        echo "However, it may increase the number of open files and make certain operations slower."
+        
+        read -p "Do you want to optimize all databases now? (y/n) " optimize_choice
+        if [ "$optimize_choice" = "y" ]; then
+            echo "Optimizing all databases..."
+            mysqlcheck -o --all-databases
+        fi
+    fi
+
+    echo -e "\n${YELLOW}Checking index usage:${NC}"
+    mysql -e "SELECT * FROM sys.schema_unused_indexes;" | column -t
+
+    echo -e "\n${YELLOW}Checking query cache efficiency:${NC}"
+    query_cache_type=$(mysql -e "SHOW VARIABLES LIKE 'query_cache_type';" | awk 'NR==2 {print $2}')
+    if [ "$query_cache_type" != "OFF" ]; then
+        mysql -e "SHOW STATUS LIKE 'Qcache%';" | column -t
+    else
+        echo "Query cache is disabled."
+    fi
+
+    echo -e "\n${YELLOW}Checking for long-running queries:${NC}"
+    mysql -e "SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, INFO FROM information_schema.PROCESSLIST WHERE COMMAND != 'Sleep' AND TIME > 100 ORDER BY TIME DESC;" | column -t
+
+    echo -e "\n${YELLOW}Checking for tables without primary keys:${NC}"
+    no_primary_key_result=$(mysql -e "SELECT DISTINCT TABLE_SCHEMA, TABLE_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA NOT IN ('information_schema', 'performance_schema', 'mysql') AND TABLE_NAME NOT IN (SELECT DISTINCT TABLE_NAME FROM information_schema.STATISTICS WHERE INDEX_NAME = 'PRIMARY');" | column -t)
+    echo "$no_primary_key_result"
+    
+    if [ -n "$no_primary_key_result" ]; then
+        echo -e "\n${YELLOW}Explanation:${NC}"
+        echo "Tables without Primary Keys: Primary keys are crucial for efficient data retrieval and maintaining data integrity."
+        echo "Tables without primary keys can lead to performance issues and data inconsistencies."
+        echo -e "\n${YELLOW}Recommendations:${NC}"
+        echo "1. Review each table and determine an appropriate primary key."
+        echo "2. Add a primary key to each table. For example:"
+        echo "   ALTER TABLE schema_name.table_name ADD COLUMN id INT AUTO_INCREMENT PRIMARY KEY;"
+        echo -e "\n${YELLOW}Caution:${NC}"
+        echo "Some tables, especially in specific applications like Magento, might be designed without primary keys for specific reasons."
+        echo "Always check the application's documentation before making changes."
+    fi
+
+    analyze_slow_queries
+}
+
+analyze_slow_queries() {
+    echo -e "\n${YELLOW}Analyzing slow queries for the past 24 hours:${NC}"
+    
+    slow_query_log=$(grep slow_query_log_file /etc/my.cnf | awk '{print$3}')
+    if [ -z "$slow_query_log" ] || [ ! -f "$slow_query_log" ]; then
+        echo -e "${RED}Slow query log not found or not configured.${NC}"
+        return
+    fi
+
+    start_time=$(date -d '24 hours ago' +'%Y-%m-%dT%H')
+    line_num=$(grep -nam 1 "$start_time" "$slow_query_log" | cut -d ':' -f1)
+
+    if [ -z "$line_num" ]; then
+        echo "No slow queries found in the last 24 hours."
+        return
+    fi
+
+    for cp_user in /home/*; do
+        cp_user=$(basename "$cp_user")
+        if [ ! -d "/home/$cp_user" ] || [[ "$cp_user" =~ ^(virtfs|latest)$ ]] || [[ "$cp_user" == *.tar.gz ]]; then
+            continue
+        fi
+        cp_user_length=${#cp_user}
+        if [ "$cp_user_length" -ge 8 ]; then
+            db_user=$( echo "$cp_user" | cut -c 1-8 )
+        else
+            db_user="$cp_user"
+        fi
+        log_file_name="/home/$cp_user/slow-queries-$(date +'%d-%b-%Y').txt"
+
+        tail -n +"$line_num" "$slow_query_log" | awk -v user="$db_user" '{ if ($0 ~ user ) { start = 1; print; } else if ($0 ~ /# User@Host:/) {start = 0 } else if (start) { print } }' > "$log_file_name"
+
+        if [ -s "$log_file_name" ]; then
+            line_num_to_add=$(tail -n +"$line_num" "$slow_query_log" | grep -nm1 "$db_user" | cut -d ':' -f 1)
+            ((line_num_to_add--))
+            line_value_to_add=$(tail -n +"$line_num" "$slow_query_log" | sed -n "$line_num_to_add"p)
+            sed -i "1s/^/$line_value_to_add\n/" "$log_file_name"
+            sed -i '$d' "$log_file_name"
+            chown "$cp_user": "$log_file_name"
+            echo "LOG FILE GENERATED: $log_file_name"
+            echo
+            echo "Total Number of Queries for $cp_user:"
+            grep -c 'Query_time' "$log_file_name"
+            echo "Execution time of the 10 slowest queries in the log for $cp_user:"
+            < "$log_file_name" grep 'Query_time' | cut -d ' ' -f 3 | sort -rh | head
+            echo "----------------------------------------"
+        else
+            echo "No Slow Queries Found for $cp_user."
+            echo "----------------------------------------"
+        fi
+    done
+}
+
+# Function to check IP against AbuseIPDB
+check_ip_blacklist() {
+    local ip=$1
+    if command_exists jq; then
+        response=$(curl -s "https://api.abuseipdb.com/api/v2/check?ipAddress=$ip" -H "Key: $API_KEY" -H "Accept: application/json")
+        confidence=$(echo "$response" | jq '.data.abuseConfidenceScore')
+        if (( confidence > 25 )); then
+            echo "$ip ($confidence%)"
+        fi
+    else
+        echo -e "${RED}jq is not installed. Unable to parse AbuseIPDB response.${NC}"
+    fi
+}
+
+# Function to block IP using CSF
+block_ip() {
+    local ip=$1
+    echo -e "Choose blocking method for IP $ip:"
+    echo "1) CSF (Config Server Firewall)"
+    echo "2) Kernel IP routing system"
+    read -p "Enter your choice (1 or 2): " choice
+
+    case $choice in
+        1)
+            if command_exists csf; then
+                if ! systemctl is-active --quiet csf; then
+                    echo "CSF is not running. Enabling CSF..."
+                    csf -e
+                fi
+                csf -d "$ip"
+                echo "$ip has been blocked using CSF"
+            else
+                echo -e "${RED}CSF is not installed. Unable to block IP using CSF.${NC}"
+            fi
+            ;;
+        2)
+            echo "Using kernel IP routing system to block $ip"
+            route add "$ip" reject
+            if [ $? -eq 0 ]; then
+                echo "$ip has been blocked using kernel IP routing"
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Blocked IP: $ip" >> /var/log/route-banned.log
+                echo "IP added to log: /var/log/route-banned.log"
+            else
+                echo -e "${RED}Failed to block $ip using kernel IP routing. Make sure you have the necessary permissions.${NC}"
+            fi
+            ;;
+        *)
+            echo -e "${RED}Invalid choice. IP not blocked.${NC}"
+            ;;
+    esac
+}
+
+# Enhanced security check function
+perform_security_checks() {
+    echo -e "${BLUE}=== Security Checks ===${NC}"
+    echo "Checking for potential DoS attacks..."
+    
+    # More nuanced approach to detect suspicious IPs
+    suspicious_ips=$(awk -v now=$(date +%s) '
+        BEGIN {
+            threshold = 100;  # 100 requests
+            window = 600;     # in 10 minutes
+        }
+        {
+            ip = $1
+            gsub(/\[/, "", $4)
+            timestamp = mktime(gensub(/(\d+)\/(\w+)\/(\d+):(\d+):(\d+):(\d+).*/, "\\3 \\2 \\1 \\4 \\5 \\6", "g", $4))
+            if (now - timestamp <= window) {
+                count[ip]++
+                if (count[ip] > threshold && !printed[ip]) {
+                    print ip
+                    printed[ip] = 1
+                }
+            }
+        }
+    ' "$APACHE_LOG" 2>/dev/null | sort | uniq)
+
+    if [ -n "$suspicious_ips" ]; then
+        echo -e "${RED}Suspicious IPs detected:${NC}"
+        echo "$suspicious_ips"
+        
+        read -p "Do you want to check these IPs against AbuseIPDB and block if necessary? (y/n) " check_abuse
+        if [ "$check_abuse" = "y" ]; then
+            if ! command_exists jq; then
+                echo -e "${RED}jq is not installed. Please install it to use this feature.${NC}"
+                return
+            fi
+            echo "$suspicious_ips" | while read ip; do
+                result=$(check_ip_blacklist "$ip")
+                if [ -n "$result" ]; then
+                    echo -e "${RED}$result is blacklisted${NC}"
+                    read -p "Do you want to block this IP? (y/n) " block
+                    if [ "$block" = "y" ]; then
+                        block_ip "$ip"
+                    fi
+                else
+                    echo -e "${GREEN}$ip is not found in AbuseIPDB${NC}"
+                fi
+            done
+        fi
+    else
+        echo -e "${GREEN}No suspicious IPs detected${NC}"
+    fi
+    
+    # Check for recent brute force attempts
+    echo -e "\n${YELLOW}Checking for recent brute force attempts...${NC}"
+    brute_force_attempts=$(grep "Failed password for" /var/log/secure | awk '{print $(NF-3)}' | sort | uniq -c | sort -nr | head -n 5)
+    if [ -n "$brute_force_attempts" ]; then
+        echo -e "${RED}Recent brute force attempts detected:${NC}"
+        echo "$brute_force_attempts"
+    else
+        echo -e "${GREEN}No recent brute force attempts detected${NC}"
+    fi
+
+    # Check for unauthorized sudo usage
+    echo -e "\n${YELLOW}Checking for unauthorized sudo usage...${NC}"
+    unauthorized_sudo=$(grep "user NOT in sudoers" /var/log/secure | tail -n 5)
+    if [ -n "$unauthorized_sudo" ]; then
+        echo -e "${RED}Unauthorized sudo usage detected:${NC}"
+        echo "$unauthorized_sudo"
+    else
+        echo -e "${GREEN}No unauthorized sudo usage detected${NC}"
+    fi
+
+    read -p "Do you want to enhance the CSF configuration? (y/n) " enhance_csf
+    if [ "$enhance_csf" = "y" ]; then
+        enhance_csf_config
+    fi
+
+    # Additional security checks
+    echo -e "\n${YELLOW}Checking for open ports...${NC}"
+    netstat -tuln | grep LISTEN
+
+    echo -e "\n${YELLOW}Checking for active SSH sessions...${NC}"
+    who | grep pts
+
+    echo -e "\n${YELLOW}Checking for users with UID 0 (root)...${NC}"
+    awk -F: '$3 == 0 {print $1}' /etc/passwd
+
+    echo -e "\n${YELLOW}Checking for world-writable files...${NC}"
+    find / -xdev -type f -perm -0002 -ls 2>/dev/null | head -n 10
+
+    echo -e "\n${YELLOW}Checking for files with SUID/SGID bit set...${NC}"
+    find / -xdev \( -perm -4000 -o -perm -2000 \) -type f -ls 2>/dev/null | head -n 10
+}
+
+# Function to enhance CSF configuration
+enhance_csf_config() {
+    if command_exists csf; then
+        CSF_CONF="/etc/csf/csf.conf"
+        echo "Enhancing CSF configuration..."
+        sed -i "s/^CONNLIMIT\s*=.*$/CONNLIMIT = \"80;85,443;85,2087;25,2083;35\"/g" $CSF_CONF
+        sed -i "s/^DROP_INVALID\s*=.*$/DROP_INVALID = \"1\"/g" $CSF_CONF
+        sed -i "s/^SYNFLOOD\s*=.*$/SYNFLOOD = \"1\"/g" $CSF_CONF
+        sed -i "s/^SYNFLOOD_RATE\s*=.*$/SYNFLOOD_RATE = \"50\/s\"/g" $CSF_CONF
+        sed -i "s/^SYNFLOOD_BURST\s*=.*$/SYNFLOOD_BURST = \"100\"/g" $CSF_CONF
+        sed -i "s/^PORTFLOOD\s*=.*$/PORTFLOOD = \"80;tcp;85;15,443;tcp;85;15,2087;tcp;25;15,2083;tcp;35;15,17177;tcp;10;15,53;udp;85;15,3306;tcp;85;15\"/g" $CSF_CONF
+        sed -i "s/^CT_INTERVAL\s*=.*$/CT_INTERVAL = \"20\"/g" $CSF_CONF
+        sed -i "s/^CT_LIMIT\s*=.*$/CT_LIMIT = \"85\"/g" $CSF_CONF
+        sed -i "s/^UDPFLOOD\s*=.*$/UDPFLOOD = \"1\"/g" $CSF_CONF
+        sed -i "s/^UDPFLOOD_LIMIT\s*=.*$/UDPFLOOD_LIMIT = \"50\/s\"/g" $CSF_CONF
+        sed -i "s/^UDPFLOOD_BURST\s*=.*$/UDPFLOOD_BURST = \"200\"/g" $CSF_CONF
+        sed -i "s/^RESTRICT_SYSLOG\s*=.*$/RESTRICT_SYSLOG = \"3\"/g" $CSF_CONF
+        sed -i "s/^DENY_IP_LIMIT\s*=.*$/DENY_IP_LIMIT = \"350\"/g" $CSF_CONF
+        sed -i "s/^CT_PERMANENT\s*=.*$/CT_PERMANENT = \"0\"/g" $CSF_CONF
+        systemctl restart csf.service
+        csf -r
+        echo "CSF configuration updated and service restarted."
+    else
+        echo -e "${RED}CSF is not installed. Unable to enhance CSF configuration.${NC}"
+    fi
+}
+
+# Function to check disk usage and I/O performance
+check_disk_performance() {
+    echo -e "${BLUE}=== Disk Usage and I/O Performance ===${NC}"
+    echo -e "${YELLOW}Disk Usage:${NC}"
+    df -h
+    echo -e "${YELLOW}I/O Wait time:${NC}"
+    iostat -x 1 5 | awk '/^[0-9]/ {print $1 " - Read: " $6 "%, Write: " $7 "%, Wait: " $10 "%, Util: " $14 "%"}'
+}
+
+# Function to check kernel and system health
+check_system_health() {
+    echo -e "${BLUE}=== Kernel and System Health ===${NC}"
+    echo -e "${YELLOW}Kernel version:${NC}"
+    uname -r
+    echo -e "${YELLOW}Last system messages:${NC}"
+    dmesg | tail -n 20
+    echo -e "${YELLOW}System uptime:${NC}"
+    uptime
+    echo -e "${YELLOW}Logged in users:${NC}"
+    who
+    echo -e "${YELLOW}Last logins:${NC}"
+    last | head -n 5
+    echo -e "${YELLOW}Available updates:${NC}"
+    if command -v apt > /dev/null; then
+        apt list --upgradable
+    elif command -v yum > /dev/null; then
+        yum check-update
+    fi
+}
+
+# Function to compare with historical data
+compare_historical() {
+    echo -e "${BLUE}=== Historical Comparison ===${NC}"
+    current_load=$(uptime | awk '{print $10 $11 $12}' | tr -d ',')
+    historical_file="$TEMP_DIR/historical_load.txt"
+    
+    if [ ! -f "$historical_file" ]; then
+        echo "$current_load" > "$historical_file"
+        echo -e "${YELLOW}Initial load recorded. Run this check again later for comparison.${NC}"
+    else
+        historical_load=$(cat "$historical_file")
+        echo -e "${YELLOW}Current load:${NC} $current_load"
+        echo -e "${YELLOW}Previous load:${NC} $historical_load"
+        
+        # Update historical data
+        echo "$current_load" > "$historical_file"
+    fi
+}
+
+# Function to detect IPs with many connections
+detect_many_connections() {
+    echo -e "${BLUE}=== Detecting IPs with Many Connections ===${NC}"
+    threshold=20
+    
+    echo -e "${YELLOW}Current active connections:${NC}"
+    netstat -ntu | awk '{print $5}' | cut -d: -f1 | sort | uniq -c | sort -nr |
+    while read count ip; do
+        if [ "$count" -gt "$threshold" ]; then
+            echo "IP: $ip - Connections: $count"
+            if command_exists jq; then
+                check_result=$(check_ip_blacklist "$ip")
+                if [ -n "$check_result" ]; then
+                    echo -e "${RED}WARNING: $check_result${NC}"
+                    read -p "Do you want to block this IP? (y/n) " block
+                    if [ "$block" = "y" ]; then
+                        block_ip "$ip"
+                    fi
+                fi
+            else
+                echo -e "${YELLOW}jq is not installed. Unable to check IP against AbuseIPDB.${NC}"
+            fi
+        else
+            break
+        fi
+    done
+
+    echo -e "\n${YELLOW}Historical connection data (past 2 hours):${NC}"
+    current_hour=$(date -u +"%d/%b/%Y:%H")
+    one_hour_ago=$(date -u -d '1 hour ago' +"%d/%b/%Y:%H")
+    two_hours_ago=$(date -u -d '2 hours ago' +"%d/%b/%Y:%H")
+
+    log_data=$(zgrep -hE "$two_hours_ago:|$one_hour_ago:|$current_hour:" /home/*/access-logs/*.gz /home/*/access-logs/* 2>/dev/null | 
+               awk '{print $1, $4}' | 
+               sed -E 's/\[([0-9]{2}\/[A-Za-z]{3}\/[0-9]{4}):([0-9]{2}).*/\1:\2/' | 
+               sort | 
+               uniq -c | 
+               sort -rn | 
+               head -n 20)
+
+    echo "$log_data" | 
+    awk '{
+        ip=$2; 
+        hour=$3; 
+        count=$1; 
+        total[ip]+=count; 
+        if(hour==curr) curr_count[ip]+=count; 
+        else if(hour==prev1) prev1_count[ip]+=count; 
+        else if(hour==prev2) prev2_count[ip]+=count
+    } 
+    END {
+        printf "%-15s %-10s %-10s %-10s %-10s\n", "IP", "Total", "Current", "1h Ago", "2h Ago";
+        for(ip in total) {
+            printf "%-15s %-10d %-10d %-10d %-10d\n", ip, total[ip], curr_count[ip]+0, prev1_count[ip]+0, prev2_count[ip]+0
+        }
+    }' curr="$current_hour" prev1="$one_hour_ago" prev2="$two_hours_ago"
+
+    total_connections=$(echo "$log_data" | awk '{sum += $1} END {print sum}')
+    echo -e "\n${YELLOW}Total connections in the past 2 hours: $total_connections${NC}"
+
+    echo -e "\n${YELLOW}Top 10 IPs with most connections in the past 2 hours:${NC}"
+    echo "$log_data" | head -n 10 | 
+    while read count ip hour; do
+        if command_exists jq; then
+            check_result=$(check_ip_blacklist "$ip")
+            if [ -n "$check_result" ]; then
+                echo -e "${RED}$ip - $count connections - $check_result${NC}"
+                read -p "Do you want to block this IP? (y/n) " block
+                if [ "$block" = "y" ]; then
+                    block_ip "$ip"
+                fi
+            else
+                echo "$ip - $count connections - Not found in AbuseIPDB"
+            fi
+        else
+            echo "$ip - $count connections"
+        fi
+    done
+}
+
+# Function to detect IPs connecting and dropping quickly
+detect_quick_connections() {
+    echo -e "${BLUE}=== Detecting IPs Connecting and Dropping Quickly ===${NC}"
+    interval=30  # Check over the last 30 seconds
+    threshold=5  # Threshold for quick connections
+
+    start_time=$(date +%s)
+    end_time=$((start_time + interval))
+
+    echo "Monitoring connections for $interval seconds..."
+    
+    # Use a temporary file instead of an associative array
+    temp_file=$(mktemp)
+
+    while [ $(date +%s) -lt $end_time ]; do
+        netstat -tn | awk '$4 ~ /:/ && $6 ~ /ESTABLISHED|SYN_SENT|SYN_RECV/ {print $5}' | cut -d: -f1 | sort | uniq -c | \
+        while read count ip; do
+            current_count=$(grep "^$ip " "$temp_file" 2>/dev/null | cut -d' ' -f2)
+            if [ -z "$current_count" ]; then
+                echo "$ip $count" >> "$temp_file"
+            else
+                new_count=$((current_count + count))
+                sed -i "s/^$ip .*/$ip $new_count/" "$temp_file"
+            fi
+        done
+        sleep 1
+    done
+
+    echo -e "${YELLOW}IPs with quick connections/disconnections:${NC}"
+    sort -rnk2 "$temp_file" | while read ip count; do
+        if [ $count -ge $threshold ]; then
+            echo "IP: $ip - Connections: $count"
+            if command_exists jq; then
+                check_result=$(check_ip_blacklist "$ip")
+                if [ -n "$check_result" ]; then
+                    echo -e "${RED}WARNING: $check_result${NC}"
+                    printf "Do you want to block this IP? (y/n) "
+                    read block
+                    if [ "$block" = "y" ]; then
+                        block_ip "$ip"
+                    fi
+                fi
+            else
+                echo -e "${YELLOW}jq is not installed. Unable to check IP against AbuseIPDB.${NC}"
+            fi
+        fi
+    done
+
+    # Clean up temporary file
+    rm -f "$temp_file"
+}
+
+analyze_access_logs_for_bots() {
+    echo -e "${BLUE}=== Analyzing Access Logs for Bot Traffic ===${NC}"
+   
+    # Ask user for time period
+    read -p "Enter time period to analyze (e.g., 24h for 24 hours, 2d for 2 days): " time_period
+   
+    # Convert time period to hours
+    case ${time_period: -1} in
+        h|H) hours=${time_period%[hH]} ;;
+        d|D) hours=$((${time_period%[dD]} * 24)) ;;
+        *) hours=24 ;; # Default to 24 hours if invalid input
+    esac
+   
+    start_time=$(date -d "$hours hours ago" '+%d/%b/%Y:%H')
+    echo "Analyzing logs from $start_time onwards..."
+   
+    # Check if any access log files exist
+    if ! ls /home/*/access-logs/* 1> /dev/null 2>&1; then
+        echo -e "${RED}No access log files found in /home/*/access-logs/${NC}"
+        return
+    fi
+
+    # Download bad bot lists
+    echo "Downloading bad bot lists..."
+    bad_referrers=$(curl -s https://raw.githubusercontent.com/mitchellkrogza/apache-ultimate-bad-bot-blocker/master/_generator_lists/bad-referrers.list)
+    fake_googlebots=$(curl -s https://raw.githubusercontent.com/mitchellkrogza/apache-ultimate-bad-bot-blocker/master/_generator_lists/fake-googlebots.list)
+    bad_user_agents=$(curl -s https://raw.githubusercontent.com/mitchellkrogza/apache-ultimate-bad-bot-blocker/master/_generator_lists/bad-user-agents.list)
+
+    echo -e "${YELLOW}Top 10 IPs:${NC}"
+    awk -v date="$start_time" '$4 > "["date {print $1}' /home/*/access-logs/* | sort | uniq -c | sort -nr | head -n 10
+
+    echo -e "\n${YELLOW}Top 10 User Agents:${NC}"
+    awk -v date="$start_time" '$4 > "["date {print $0}' /home/*/access-logs/* | 
+    awk -F'"' '{print $(NF-1)}' | sort | uniq -c | sort -nr | head -n 10
+
+    echo -e "\n${RED}Bad Bots Detected:${NC}"
+    awk -v date="$start_time" '$4 > "["date {print $0}' /home/*/access-logs/* | 
+    awk -F'"' '{print $(NF-1)}' | grep -v '^-$' | sort | uniq -c | sort -nr |
+    while read count user_agent; do
+        if grep -qiF "$user_agent" <(echo "$bad_user_agents"); then
+            bot_name=$(echo "$user_agent" | grep -oiE '^[^/]+')
+            echo -e "${RED}$bot_name${NC} - $count requests"
+        fi
+    done
+
+    echo -e "\n${RED}Fake Google Bots Detected:${NC}"
+    awk -v date="$start_time" '$4 > "["date {print $1, $(NF-1)}' /home/*/access-logs/* | 
+    sort | uniq -c | sort -nr |
+    while read count ip user_agent; do
+        if grep -qiF "$ip" <(echo "$fake_googlebots"); then
+            echo -e "${RED}$ip${NC} - $count requests - User Agent: $user_agent"
+        fi
+    done
+
+    echo -e "\n${RED}Bad Referrers Detected:${NC}"
+    awk -v date="$start_time" '$4 > "["date {print $11}' /home/*/access-logs/* | 
+    sed 's/"//g' | grep -v '^-$' | sort | uniq -c | sort -nr |
+    while read count referrer; do
+        if grep -qiF "$referrer" <(echo "$bad_referrers"); then
+            echo -e "${RED}$referrer${NC} - $count times"
+        fi
+    done
+
+    echo -e "\n${YELLOW}Summary:${NC}"
+    total_requests=$(awk -v date="$start_time" '$4 > "["date' /home/*/access-logs/* | wc -l)
+    bad_bot_requests=$(awk -v date="$start_time" '$4 > "["date {print $(NF-1)}' /home/*/access-logs/* | 
+    grep -vif <(echo "^-$") | grep -cif <(echo "$bad_user_agents"))
+    fake_googlebot_requests=$(awk -v date="$start_time" '$4 > "["date {print $1}' /home/*/access-logs/* | 
+    grep -cif <(echo "$fake_googlebots"))
+    bad_referrer_requests=$(awk -v date="$start_time" '$4 > "["date {print $11}' /home/*/access-logs/* | 
+    sed 's/"//g' | grep -v '^-$' | grep -cif <(echo "$bad_referrers"))
+    
+    echo "Total requests: $total_requests"
+    echo "Bad bot requests: $bad_bot_requests"
+    echo "Fake Google bot requests: $fake_googlebot_requests"
+    echo "Bad referrer requests: $bad_referrer_requests"
+    echo "Percentage of bad traffic: $(awk "BEGIN {printf \"%.2f%%\", (($bad_bot_requests + $fake_googlebot_requests + $bad_referrer_requests) / $total_requests) * 100}")"
+
+    # Ask user if they want to implement the Bad User Agent Blocker
+    read -p "Do you want to implement the Bad User Agent Blocker? (y/n): " implement_blocker
+    if [[ $implement_blocker != "y" ]]; then
+        echo "Bad User Agent Blocker implementation skipped."
+        return
+    fi
+
+    echo -e "\n${YELLOW}Implementing Bad User Agent Blocker${NC}"
+
+    APACHE_VERSION='2.4'
+    APACHE_CONF='/etc/apache2'
+    BLOCKER_URL="https://raw.githubusercontent.com/mitchellkrogza/apache-ultimate-bad-bot-blocker/master/Apache_${APACHE_VERSION}/custom.d"
+
+    sudo mkdir -p "${APACHE_CONF}/custom.d"
+    sudo wget ${BLOCKER_URL}/globalblacklist.conf -O "${APACHE_CONF}/custom.d/globalblacklist.conf"
+    sudo wget ${BLOCKER_URL}/whitelist-ips.conf -O "${APACHE_CONF}/custom.d/whitelist-ips.conf"
+    sudo wget ${BLOCKER_URL}/whitelist-domains.conf -O "${APACHE_CONF}/custom.d/whitelist-domains.conf"
+    sudo wget ${BLOCKER_URL}/blacklist-ips.conf -O "${APACHE_CONF}/custom.d/blacklist-ips.conf"
+    sudo wget ${BLOCKER_URL}/bad-referrer-words.conf -O "${APACHE_CONF}/custom.d/bad-referrer-words.conf"
+    sudo wget ${BLOCKER_URL}/blacklist-user-agents.conf -O "${APACHE_CONF}/custom.d/blacklist-user-agents.conf"
+
+    echo -e "${GREEN}Bad Bot Blocker files downloaded and installed.${NC}"
+
+    # Add Cloudflare IP ranges and server IPs to whitelist
+    echo -e "\n${YELLOW}Adding Cloudflare IP ranges and server IPs to whitelist${NC}"
+    {
+        echo "# Cloudflare IP ranges"
+        echo "Require ip 103.21.244.0/22"
+        echo "Require ip 103.22.200.0/22"
+        echo "Require ip 103.31.4.0/22"
+        echo "Require ip 104.16.0.0/13"
+        echo "Require ip 104.24.0.0/14"
+        echo "Require ip 108.162.192.0/18"
+        echo "Require ip 131.0.72.0/22"
+        echo "Require ip 141.101.64.0/18"
+        echo "Require ip 162.158.0.0/15"
+        echo "Require ip 172.64.0.0/13"
+        echo "Require ip 173.245.48.0/20"
+        echo "Require ip 188.114.96.0/20"
+        echo "Require ip 190.93.240.0/20"
+        echo "Require ip 197.234.240.0/22"
+        echo "Require ip 198.41.128.0/17"
+        echo "Require ip 199.27.128.0/21"
+        echo "Require ip 2400:cb00::/32"
+        echo "Require ip 2606:4700::/32"
+        echo "Require ip 2803:f800::/32"
+        echo "Require ip 2405:b500::/32"
+        echo "Require ip 2405:8100::/32"
+        echo "Require ip 2c0f:f248::/32"
+        echo "Require ip 2a06:98c0::/29"
+        echo ""
+        echo "# Server IPs"
+        ip addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | while read -r ip; do
+            echo "Require ip $ip"
+        done
+    } >> "${APACHE_CONF}/custom.d/whitelist-ips.conf"
+    
+    echo -e "${GREEN}Cloudflare IP ranges and server IPs added to whitelist.${NC}"
+
+    # Generate virtual host configuration
+    echo -e "\n${YELLOW}Virtual Host Configuration${NC}"
+    echo "Add the following block to your virtual host configuration in WHM's Apache pre-include setting:"
+    echo -e "${GREEN}<Location \"/\">
+    Include ${APACHE_CONF}/custom.d/globalblacklist.conf
+</Location>${NC}"
+
+    echo -e "\n${YELLOW}Next Steps:${NC}"
+    echo "1. Add the above block to your virtual host configuration in WHM."
+    echo "2. Restart Apache to apply the changes."
+    echo "3. Monitor your logs to ensure the bad bot blocker is working as expected."
+}
+cloudflare_under_attack_mode() {
+    echo -e "${BLUE}=== Cloudflare Under Attack Mode and CDN Check ===${NC}"
+
+    read -p "Do you want to enable Cloudflare Under Attack Mode? (y/n): " enable_cloudflare
+
+    if [[ $enable_cloudflare == "y" || $enable_cloudflare == "Y" ]]; then
+        if [ -z "$CF_EMAIL" ] || [ -z "$CF_APIKEY" ] || [ -z "$CF_ZONEID" ]; then
+            echo -e "${YELLOW}Cloudflare configuration is incomplete. Please provide the following information:${NC}"
+            read -p "Enter Cloudflare Email: " CF_EMAIL
+            read -p "Enter Cloudflare API Key: " CF_APIKEY
+            read -p "Enter Cloudflare Zone ID: " CF_ZONEID
+        fi
+
+        # Get current CPU load
+        current_load=$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1}')
+   
+        # Get current Cloudflare security level
+        if command_exists jq; then
+            cf_status=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CF_ZONEID/settings/security_level" \
+                -H "X-Auth-Email: $CF_EMAIL" \
+                -H "X-Auth-Key: $CF_APIKEY" \
+                -H "Content-Type: application/json" | jq -r '.result.value')
+        else
+            echo -e "${RED}jq is not installed. Unable to parse Cloudflare API response.${NC}"
+            return
+        fi
+   
+        echo "Current CPU load: $current_load%"
+        echo "Current Cloudflare security level: $cf_status"
+   
+        if [ $(echo "$current_load > $UPPER_CPU_LIMIT" | bc -l) -eq 1 ] && [ "$cf_status" != "under_attack" ]; then
+            echo "High CPU load detected. Enabling Under Attack Mode..."
+            enable_under_attack_mode
+        elif [ $(echo "$current_load < $LOWER_CPU_LIMIT" | bc -l) -eq 1 ] && [ "$cf_status" = "under_attack" ]; then
+            echo "CPU load has normalized. Disabling Under Attack Mode..."
+            disable_under_attack_mode
+        else
+            echo "No change in Cloudflare security level necessary."
+        fi
+    fi
+
+    echo -e "\n${YELLOW}Checking domains for CDN usage:${NC}"
+    
+    # Get all domains from WHM API
+    domains_info=$(whmapi1 --output=jsonpretty get_domain_info | jq -r '.data.domains[] | select(.domain_type == "main" or .domain_type == "addon") | .domain')
+
+    # List of common CDN nameservers
+cdn_ns=(
+    "cloudflare.com"
+    "ns.cloudflare.com"
+    "cdns.net"
+    "cdns.com"
+    "akam.net"
+    "edgekey.net"
+    "edgesuite.net"
+    "akamai.net"
+    "akamaiedge.net"
+    "amazon.com"
+    "amazonaws.com"
+    "cloudfront.net"
+    "fastly.net"
+    "quic.cloud"
+    "bttstorage.com"
+    "quicns.com"
+    "cdn77.com"
+    "maxcdn.net"
+    "stackpathdns.com"
+    "keycdn.com"
+    "cdnsun.net"
+    "google.com"
+    "googledomains.com"
+    "gcdn.co"
+    "cachefly.net"
+    "cdnvideo.ru"
+    "limelight.com"
+    "incapsula.net"
+    "bitgravity.com"
+    "hwcdn.net"
+    "belugacdn.com"
+    "stackpathdns.com"
+    "leasewebcdn.com"
+    "nyiftw.net"
+    "resrc.it"
+    "mncdn.com"
+    "adn.network"
+    "panthercdn.com"
+    "azureedge.net"
+    "azurefd.net"
+    "alicdn.com"
+    "turbobytes-cdn.com"
+    "tl88.net"
+    "dynect.net"
+    "tencent-cloud.net"
+    "chinacache.net"
+    "wangsu.com"
+)
+
+    for domain in $domains_info; do
+        echo -e "\nChecking $domain:"
+        ns_records=$(dig ns +short $domain)
+        using_cdn=false
+        
+        for ns in $ns_records; do
+            for cdn in "${cdn_ns[@]}"; do
+                if [[ $ns == *"$cdn"* ]]; then
+                    echo "  Using CDN: $cdn"
+                    using_cdn=true
+                    break 2
+                fi
+            done
+        done
+        
+        if [ "$using_cdn" = false ]; then
+            echo -e "${RED}  Warning: $domain is not using a recognized CDN${NC}"
+        fi
+    done
+}
+
+# Function to enable Cloudflare Under Attack Mode
+enable_under_attack_mode() {
+    curl -s -X PATCH "https://api.cloudflare.com/client/v4/zones/$CF_ZONEID/settings/security_level" \
+        -H "X-Auth-Email: $CF_EMAIL" \
+        -H "X-Auth-Key: $CF_APIKEY" \
+        -H "Content-Type: application/json" \
+        --data '{"value":"under_attack"}' > /dev/null
+   
+    echo "Under Attack Mode enabled."
+    date +%s > "$TEMP_DIR/cf_uam_enabled_time"
+}
+
+# Function to disable Cloudflare Under Attack Mode
+disable_under_attack_mode() {
+    local uam_enabled_time=$(cat "$TEMP_DIR/cf_uam_enabled_time")
+    local current_time=$(date +%s)
+    local time_diff=$((current_time - uam_enabled_time))
+   
+    if [ $time_diff -ge $TIME_LIMIT_BEFORE_REVERT ]; then
+        curl -s -X PATCH "https://api.cloudflare.com/client/v4/zones/$CF_ZONEID/settings/security_level" \
+            -H "X-Auth-Email: $CF_EMAIL" \
+            -H "X-Auth-Key: $CF_APIKEY" \
+            -H "Content-Type: application/json" \
+            --data '{"value":"'"$REGULAR_STATUS"'"}' > /dev/null
+       
+        echo "Under Attack Mode disabled. Reverted to $REGULAR_STATUS security level."
+        rm "$TEMP_DIR/cf_uam_enabled_time"
+    else
+        echo "Under Attack Mode will be disabled after $(($TIME_LIMIT_BEFORE_REVERT - $time_diff)) more seconds."
+    fi
+}
+
+# Function to enable Cloudflare Under Attack Mode
+enable_under_attack_mode() {
+    curl -s -X PATCH "https://api.cloudflare.com/client/v4/zones/$CF_ZONEID/settings/security_level" \
+        -H "X-Auth-Email: $CF_EMAIL" \
+        -H "X-Auth-Key: $CF_APIKEY" \
+        -H "Content-Type: application/json" \
+        --data '{"value":"under_attack"}' > /dev/null
+   
+    echo "Under Attack Mode enabled."
+    date +%s > "$TEMP_DIR/cf_uam_enabled_time"
+}
+
+# Function to disable Cloudflare Under Attack Mode
+disable_under_attack_mode() {
+    local uam_enabled_time=$(cat "$TEMP_DIR/cf_uam_enabled_time")
+    local current_time=$(date +%s)
+    local time_diff=$((current_time - uam_enabled_time))
+   
+    if [ $time_diff -ge $TIME_LIMIT_BEFORE_REVERT ]; then
+        curl -s -X PATCH "https://api.cloudflare.com/client/v4/zones/$CF_ZONEID/settings/security_level" \
+            -H "X-Auth-Email: $CF_EMAIL" \
+            -H "X-Auth-Key: $CF_APIKEY" \
+            -H "Content-Type: application/json" \
+            --data '{"value":"'"$REGULAR_STATUS"'"}' > /dev/null
+       
+        echo "Under Attack Mode disabled. Reverted to $REGULAR_STATUS security level."
+        rm "$TEMP_DIR/cf_uam_enabled_time"
+    else
+        echo "Under Attack Mode will be disabled after $(($TIME_LIMIT_BEFORE_REVERT - $time_diff)) more seconds."
+    fi
+}
+
+# Function to enable Cloudflare Under Attack Mode
+enable_under_attack_mode() {
+    curl -s -X PATCH "https://api.cloudflare.com/client/v4/zones/$CF_ZONEID/settings/security_level" \
+        -H "X-Auth-Email: $CF_EMAIL" \
+        -H "X-Auth-Key: $CF_APIKEY" \
+        -H "Content-Type: application/json" \
+        --data '{"value":"under_attack"}' > /dev/null
+    
+    echo "Under Attack Mode enabled."
+    date +%s > "$TEMP_DIR/cf_uam_enabled_time"
+}
+
+# Function to disable Cloudflare Under Attack Mode
+disable_under_attack_mode() {
+    local uam_enabled_time=$(cat "$TEMP_DIR/cf_uam_enabled_time")
+    local current_time=$(date +%s)
+    local time_diff=$((current_time - uam_enabled_time))
+    
+    if [ $time_diff -ge $TIME_LIMIT_BEFORE_REVERT ]; then
+        curl -s -X PATCH "https://api.cloudflare.com/client/v4/zones/$CF_ZONEID/settings/security_level" \
+            -H "X-Auth-Email: $CF_EMAIL" \
+            -H "X-Auth-Key: $CF_APIKEY" \
+            -H "Content-Type: application/json" \
+            --data '{"value":"'"$REGULAR_STATUS"'"}' > /dev/null
+        
+        echo "Under Attack Mode disabled. Reverted to $REGULAR_STATUS security level."
+        rm "$TEMP_DIR/cf_uam_enabled_time"
+    else
+        echo "Under Attack Mode will be disabled after $(($TIME_LIMIT_BEFORE_REVERT - $time_diff)) more seconds."
+    fi
+}
+
+# Detect common CMS installations on the server
+detect_cms() {
+    echo -e "${BLUE}=== Detecting Content Management Systems ===${NC}"
+
+    # Get domain info using whmapi1 and parse it with awk
+    whmapi1 --output=jsonpretty get_domain_info | awk '
+        /"docroot"/ {
+            split($0, a, "\"")
+            docroot = a[4]
+        }
+        /"domain"/ {
+            split($0, a, "\"")
+            domain = a[4]
+            print docroot "," domain
+        }
+    ' | while IFS=',' read -r docroot domain
+    do
+        echo -e "${YELLOW}Scanning $domain...${NC}"
+        
+        # Check for WordPress
+        if [ -f "$docroot/wp-config.php" ]; then
+            version=$(grep "wp_version =" "$docroot/wp-includes/version.php" | cut -d "'" -f 2)
+            echo -e "${GREEN}$docroot - WordPress $version${NC}"
+        
+        # Check for Joomla
+        elif [ -f "$docroot/configuration.php" ] && [ -d "$docroot/administrator" ]; then
+            version=$(grep "RELEASE" "$docroot/libraries/src/Version.php" | awk -F"'" '{print $2}')
+            echo -e "${GREEN}$docroot - Joomla $version${NC}"
+        
+        # Check for Drupal
+        elif [ -f "$docroot/core/lib/Drupal.php" ]; then
+            version=$(grep "VERSION =" "$docroot/core/lib/Drupal.php" | cut -d "'" -f 2)
+            echo -e "${GREEN}$docroot - Drupal $version${NC}"
+        
+        # Check for Magento
+        elif [ -f "$docroot/app/Mage.php" ]; then
+            echo -e "${GREEN}$docroot - Magento (version unknown)${NC}"
+        
+        # Check for PrestaShop
+        elif [ -f "$docroot/config/settings.inc.php" ]; then
+            echo -e "${GREEN}$docroot - PrestaShop (version unknown)${NC}"
+        
+        # No CMS detected
+        else
+            echo -e "${RED}No CMS detected for $domain${NC}"
+        fi
+    done
+    
+    echo -e "${YELLOW}CMS detection complete.${NC}"
+}
+
+imunify_antivirus_scan() {
+    echo -e "${BLUE}=== Imunify Antivirus Scan ===${NC}"
+    echo "1) Start new scan"
+    echo "2) Check recent scan results"
+    echo "3) View user scan summary"
+    read -p "Enter your choice (1, 2, or 3): " choice
+
+    case $choice in
+        1)
+            echo "Starting new scan..."
+            imunify-antivirus malware on-demand start --path /
+            echo "Scan started. Please wait for it to complete."
+            ;;
+        2)
+            echo "Checking recent scan results..."
+            # Get the most recent scan ID
+            recent_scan_id=$(imunify-antivirus malware malicious list --limit=1 | awk 'NR==2 {print $7}')
+            
+            if [ -z "$recent_scan_id" ]; then
+                echo "No recent scans found."
+            else
+                echo "Most recent scan ID: $recent_scan_id"
+                
+                # Create a filename with the current date
+                output_file="malware_scan-$(date +%d.%m.%Y).txt"
+                
+                # Run the command and save results to the file
+                imunify-antivirus malware malicious list --limit=10000 --by-scan-id "$recent_scan_id" | awk '{print $8}' >> "$output_file"
+                
+                echo "Scan results saved to $output_file"
+                
+                # Display a summary of the results
+                malware_count=$(wc -l < "$output_file")
+                echo "Number of malicious files detected: $malware_count"
+                
+                if [ $malware_count -gt 0 ]; then
+                    echo "First 5 malicious files:"
+                    head -n 5 "$output_file"
+                fi
+            fi
+            ;;
+        3)
+            echo "Viewing user scan summary..."
+            user_summary_file="imunify_user_summary-$(date +%d.%m.%Y).txt"
+            imunify-antivirus malware user list > "$user_summary_file"
+            echo "User scan summary saved to $user_summary_file"
+            
+            # Display the summary
+            echo -e "\n${YELLOW}User Scan Summary:${NC}"
+            cat "$user_summary_file"
+            
+            # Count users with infections
+            infected_users=$(awk 'NR>1 && $3 > 0' "$user_summary_file" | wc -l)
+            echo -e "\n${RED}Number of users with infections: $infected_users${NC}"
+            
+            if [ $infected_users -gt 0 ]; then
+                echo -e "\n${YELLOW}Users with infections:${NC}"
+                awk 'NR>1 && $3 > 0 {print $2, "- Infected files:", $3}' "$user_summary_file"
+                
+                echo -e "\n${YELLOW}Do you want to see detailed results for a specific user? (y/n)${NC}"
+                read -p "Enter your choice: " show_detail
+                if [ "$show_detail" = "y" ]; then
+                    read -p "Enter the username: " username
+                    user_scan_id=$(awk -v user="$username" '$2 == user {print $6}' "$user_summary_file")
+                    if [ -n "$user_scan_id" ]; then
+                        echo "Fetching detailed results for user $username (Scan ID: $user_scan_id)..."
+                        imunify-antivirus malware malicious list --limit=10000 --by-scan-id "$user_scan_id"
+                    else
+                        echo "No scan ID found for user $username"
+                    fi
+                fi
+            fi
+            ;;
+        *)
+            echo -e "${RED}Invalid option. Please try again.${NC}"
+            ;;
+    esac
+}
+
+# Main function to run selected checks
+run_diagnostics() {
+    local output_file="$TEMP_DIR/server_diagnostics_$(date +%Y%m%d_%H%M%S).log"
+    case $1 in
+        1) check_system_resources | tee -a "$output_file" ;;
+        2) analyze_network_traffic | tee -a "$output_file" ;;
+        3) perform_security_checks | tee -a "$output_file" ;;
+        4) monitor_processes | tee -a "$output_file" ;;
+        5) check_database_performance | tee -a "$output_file" ;;
+        6) check_disk_performance | tee -a "$output_file" ;;
+        7) analyze_logs | tee -a "$output_file" ;;
+        8) compare_historical | tee -a "$output_file" ;;
+        9) check_system_health | tee -a "$output_file" ;;
+        10) detect_many_connections | tee -a "$output_file" ;;
+        11) detect_quick_connections | tee -a "$output_file" ;;
+        12) analyze_access_logs_for_bots | tee -a "$output_file" ;;
+        13) cloudflare_under_attack_mode | tee -a "$output_file" ;;
+        14) detect_cms | tee -a "$output_file" ;;
+        15) imunify_antivirus_scan | tee -a "$output_file" ;;
+    esac
+    echo -e "${GREEN}Results saved in $output_file${NC}"
+}
+
+# Check for required commands
+check_required_commands() {
+    local required_commands=("awk" "sed" "grep" "netstat" "ps" "df" "iostat" "curl" "jq")
+    local missing_commands=()
+
+    for cmd in "${required_commands[@]}"; do
+        if ! command_exists "$cmd"; then
+            missing_commands+=("$cmd")
+        fi
+    done
+
+    if [ ${#missing_commands[@]} -ne 0 ]; then
+        echo -e "${RED}The following required commands are missing:${NC}"
+        for cmd in "${missing_commands[@]}"; do
+            echo "  - $cmd"
+        done
+        echo -e "${YELLOW}Please install these commands and run the script again.${NC}"
+        exit 1
+    fi
+}
+
+# Main execution
+check_required_commands
+
+# Main loop
+while true
+do
+    display_menu
+    case $choice in
+        0) echo "Exiting..."; exit 0 ;;
+        1|2|3|4|5|6|7|8|9|10|11|12|13|14|15) run_diagnostics $choice ;;
+        *) echo -e "${RED}Invalid option. Please try again.${NC}" ;;
+    esac
+    echo
+    read -p "Press Enter to continue..."
+done
